@@ -29,3 +29,7 @@ dependencies = [
 
 [project.scripts]
 verify-action-build = "verify_action_build:main"
+
+[tool.uv]
+required-version = ">=0.9.17"
+exclude-newer = "4 days"
