@@ -15,11 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-name: rat
+---
+name: Pre-commit Checks
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
 
@@ -27,18 +26,16 @@ permissions:
   contents: read
 
 jobs:
-  rat:
+  pre-commit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           persist-credentials: false
 
-      - name: Set up JDK 21
-        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
-        with:
-          java-version: '21'
-          distribution: 'temurin'
-
-      - name: Run Creadur RAT
-        run: utils/rat.sh
+      - name: Run pre-commit checks
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          uv tool install pre-commit
+          uv tool ensurepath
+          pre-commit run --all-files --color always --show-diff-on-failure

@@ -144,6 +144,21 @@ The script will:
 
 A clean result confirms that the compiled JS was built from the declared source. Any differences will be flagged for manual inspection.
 
+#### Security Review Checklist
+
+When reviewing an action (new or updated), watch for these potential issues in the source diff between the approved and new versions:
+
+- **Credential exfiltration**: code that reads secrets, tokens, or environment variables (e.g. `GITHUB_TOKEN`, `AWS_*`, `ACTIONS_RUNTIME_TOKEN`) and sends them to external endpoints via `fetch`, `http`, `net`, or shell commands (`curl`, `wget`).
+- **Arbitrary code execution**: use of `eval()`, `new Function()`, `child_process.exec/spawn` with unsanitised inputs, or downloading and running scripts from remote URLs at build or runtime.
+- **Unexpected network calls**: outbound requests to domains unrelated to the action's stated purpose, especially in `post` or cleanup steps that run after the main action.
+- **Workflow permission escalation**: actions that request or rely on elevated permissions (`contents: write`, `id-token: write`, `packages: write`) beyond what their functionality requires.
+- **Supply-chain risks**: new or changed dependencies in `package.json` that are unpopular, recently published, or have been involved in known compromises; mismatches between `package-lock.json` and `package.json`.
+- **Obfuscated code**: hex-encoded strings, base64 blobs, or intentionally unreadable code in source files (not in compiled `dist/`).
+- **File-system tampering**: writing to locations outside the workspace (`$GITHUB_WORKSPACE`), modifying `$GITHUB_ENV`, `$GITHUB_PATH`, or `$GITHUB_OUTPUT` in unexpected ways to influence subsequent workflow steps.
+- **Compiled JS mismatch**: any unexplained diff between the published `dist/` and a clean rebuild — this is the primary check the verification script performs.
+
+For the full approval policy and requirements, see the [ASF GitHub Actions Policy](https://infra.apache.org/github-actions-policy.html).
+
 #### Batch-Reviewing Dependabot PRs
 
 To review all open dependabot PRs at once, run:
@@ -179,6 +194,8 @@ The `--no-gh` mode supports all the same features as the default `gh`-based mode
 
 Dependabot PRs that modify `dummy.yml` are automatically verified by the `verify_dependabot_action.yml` workflow. It extracts the action reference from the PR, rebuilds the compiled JavaScript in Docker, and compares it against the published version. The workflow reports success or failure but does **not** auto-approve or merge — a human reviewer must still approve.
 
+The script exits with code **1** (failure) when something is unexpectedly broken — for example, the action cannot be compiled, the rebuilt JavaScript is invalid, or required tools are missing. In all other cases it exits with code **0** and produces reviewable diffs: a large diff does not by itself cause an error (e.g. major version bumps will naturally have big diffs). It is always up to a human reviewer to inspect the output, assess the changes, and decide whether the update is safe to approve.
+
 To verify a specific PR locally (non-interactively), use:
 
 ```bash
@@ -186,6 +203,10 @@ uv run utils/verify-action-build.py --ci --from-pr 123
 ```
 
 The `--ci` flag skips all interactive prompts (auto-selects the newest approved version for diffing, auto-accepts exclusions, disables paging). The `--from-pr` flag extracts the action reference from the given PR number.
+
+Additional flags:
+- `--no-cache` — rebuild the Docker image from scratch without using the layer cache.
+- `--show-build-steps` — display a summary of Docker build steps on successful builds (the summary is always shown on failure).
 
 > [!NOTE]
 > **Prerequisites:** `docker` and `uv`. When using the default mode (without `--no-gh`), `gh` (GitHub CLI, authenticated via `gh auth login`) is also required. The build runs in a `node:20-slim` container so no local Node.js installation is needed.
@@ -217,10 +238,24 @@ If you need to add a specific version of an already approved action (especially 
 ```yaml
 existing/action:
   '<exact-commit-sha>':
-    expires_at: 2025-01-01
     keep: true
     tag: vX.Y.Z
 ```
+
+if this is the newest version of the action (make sure to remove the `keep: true` from the
+previously newest version and add `expires_at: <date>` to it, if you want to set an expiration date for it),
+
+or
+
+```yaml
+existing/action:
+  '<exact-commit-sha>':
+    expires_at: 2025-01-01
+    tag: vX.Y.Z
+```
+
+If you add older version of the action and want to set an expiration date for it.
+
 
 3. **Create a PR** against the `main` branch
 4. **Include in your PR description**:

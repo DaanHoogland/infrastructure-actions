@@ -33,6 +33,9 @@ rebuilds it, and diffs the published compiled JS against the locally built outpu
 
 Usage:
     uv run verify-action-build.py dorny/test-reporter@df6247429542221bc30d46a036ee47af1102c451
+
+Security review checklist:
+    https://github.com/apache/infrastructure-actions#security-review-checklist
 """
 
 import argparse
@@ -54,13 +57,22 @@ from rich.prompt import Confirm
 from rich.table import Table
 from rich.text import Text
 
-console = Console(stderr=True)
-output = Console()
+_is_ci = os.environ.get("CI") is not None
+_ci_console_options = {"force_interactive": False, "width": 200} if _is_ci else {}
+console = Console(stderr=True, force_terminal=_is_ci, **_ci_console_options)
+output = Console(force_terminal=_is_ci, **_ci_console_options)
+
+def link(url: str, text: str) -> str:
+    """Return Rich-markup hyperlink, falling back to plain text in CI."""
+    if _is_ci:
+        return text
+    return f"[link={url}]{text}[/link]"
 
 # Path to the actions.yml file relative to the script
 ACTIONS_YML = Path(__file__).resolve().parent.parent / "actions.yml"
 
 GITHUB_API = "https://api.github.com"
+SECURITY_CHECKLIST_URL = "https://github.com/apache/infrastructure-actions#security-review-checklist"
 
 
 def _detect_repo() -> str:
@@ -435,7 +447,7 @@ def show_approved_versions(
         approval = find_approval_info(entry["hash"], gh=gh)
 
         tag = entry.get("tag", "")
-        hash_link = f"[link=https://github.com/{org}/{repo}/commit/{entry['hash']}]{entry['hash'][:12]}[/link]"
+        hash_link = link(f"https://github.com/{org}/{repo}/commit/{entry['hash']}", entry['hash'][:12])
 
         approved_by = ""
         approved_on = ""
@@ -446,7 +458,7 @@ def show_approved_versions(
             approved_on = (approval.get("merged_at") or approval.get("date", ""))[:10]
             if "pr_number" in approval:
                 pr_num = approval["pr_number"]
-                pr_link = f"[link=https://github.com/apache/infrastructure-actions/pull/{pr_num}]#{pr_num}[/link]"
+                pr_link = link(f"https://github.com/apache/infrastructure-actions/pull/{pr_num}", f"#{pr_num}")
 
         table.add_row(tag, hash_link, approved_by, approved_on, pr_link)
 
@@ -516,7 +528,7 @@ def show_commits_between(
     if not raw_commits and not gh:
         # Fallback: should not happen if gh is always provided, but kept for safety
         console.print(f"  [yellow]Could not fetch commits. View on GitHub:[/yellow]")
-        console.print(f"  [link={compare_url}]{compare_url}[/link]")
+        console.print(f"  {link(compare_url, compare_url)}")
         return
 
     commits = [
@@ -541,14 +553,14 @@ def show_commits_between(
 
     for c in commits:
         sha = c.get("sha", "")
-        commit_link = f"[link=https://github.com/{org}/{repo}/commit/{sha}]{sha[:12]}[/link]"
+        commit_link = link(f"https://github.com/{org}/{repo}/commit/{sha}", sha[:12])
         author = c.get("author", "")
         date = c.get("date", "")[:10]
         message = c.get("message", "")
         table.add_row(commit_link, author, date, message)
 
     console.print(table)
-    console.print(f"\n  Full comparison (dist/ excluded): [link={compare_url}]{compare_url}[/link]")
+    console.print(f"\n  Full comparison (dist/ excluded): {link(compare_url, compare_url)}")
     console.print(f"  [dim]{len(commits)} commit(s) between versions — dist/ is generated, source changes shown separately below[/dim]")
 
 
@@ -740,7 +752,8 @@ def diff_approved_vs_new(
 
 
 DOCKERFILE_TEMPLATE = """\
-FROM node:20-slim
+ARG NODE_VERSION=20
+FROM node:${NODE_VERSION}-slim
 
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 RUN corepack enable
@@ -873,9 +886,73 @@ RUN OUT_DIR=$(cat /out-dir.txt); \
 """
 
 
+def detect_node_version(
+    org: str, repo: str, commit_hash: str, sub_path: str = "",
+    gh: GitHubClient | None = None,
+) -> str:
+    """Detect the Node.js major version from the action's using: field.
+
+    Fetches action.yml from GitHub at the given commit and extracts the
+    node version (e.g. 'node20' -> '20').  Falls back to '20' if detection fails.
+    """
+    # Try action.yml then action.yaml, in sub_path first if given
+    candidates = []
+    if sub_path:
+        candidates.extend([f"{sub_path}/action.yml", f"{sub_path}/action.yaml"])
+    candidates.extend(["action.yml", "action.yaml"])
+
+    for path in candidates:
+        url = f"https://raw.githubusercontent.com/{org}/{repo}/{commit_hash}/{path}"
+        try:
+            resp = requests.get(url, timeout=10)
+            if not resp.ok:
+                continue
+            for line in resp.text.splitlines():
+                match = re.match(r"\s+using:\s*['\"]?(node\d+)['\"]?", line)
+                if match:
+                    version = match.group(1).replace("node", "")
+                    return version
+        except requests.RequestException:
+            continue
+
+    return "20"
+
+
+def _print_docker_build_steps(build_result: subprocess.CompletedProcess[str]) -> None:
+    """Parse and display Docker build step summaries from --progress=plain output."""
+    build_output = build_result.stderr + build_result.stdout
+    step_names: dict[str, str] = {}   # step_id -> description
+    step_status: dict[str, str] = {}  # step_id -> "DONE 1.2s" / "CACHED"
+    for line in build_output.splitlines():
+        # Step description:  #5 [3/12] RUN apt-get update ...
+        m = re.match(r"^#(\d+)\s+(\[.+)", line)
+        if m:
+            step_names[m.group(1)] = m.group(2)
+            continue
+        # Done / cached:  #5 DONE 1.2s   or   #5 CACHED
+        m = re.match(r"^#(\d+)\s+(DONE\s+[\d.]+s|CACHED)", line)
+        if m:
+            step_status[m.group(1)] = m.group(2)
+
+    if step_names:
+        console.print()
+        console.rule("[bold blue]Docker build steps[/bold blue]")
+        for sid in sorted(step_names, key=lambda x: int(x)):
+            name = step_names[sid]
+            status_str = step_status.get(sid, "")
+            if "CACHED" in status_str:
+                console.print(f"  [dim]✓ {name} (cached)[/dim]")
+            else:
+                console.print(f"  [green]✓[/green] {name} [dim]{status_str}[/dim]")
+        console.print()
+
+
 def build_in_docker(
     org: str, repo: str, commit_hash: str, work_dir: Path,
     sub_path: str = "",
+    gh: GitHubClient | None = None,
+    cache: bool = True,
+    show_build_steps: bool = False,
 ) -> tuple[Path, Path, str, str]:
     """Build the action in a Docker container and extract original + rebuilt dist.
 
@@ -898,8 +975,8 @@ def build_in_docker(
     if sub_path:
         action_display += f"/{sub_path}"
 
-    repo_link = f"[link=https://github.com/{org}/{repo}]{action_display}[/link]"
-    commit_link = f"[link=https://github.com/{org}/{repo}/commit/{commit_hash}]{commit_hash}[/link]"
+    repo_link = link(f"https://github.com/{org}/{repo}", action_display)
+    commit_link = link(f"https://github.com/{org}/{repo}/commit/{commit_hash}", commit_hash)
 
     info_table = Table(show_header=False, box=None, padding=(0, 1))
     info_table.add_column(style="bold")
@@ -909,32 +986,52 @@ def build_in_docker(
     console.print()
     console.print(Panel(info_table, title="Action Build Verification", border_style="blue"))
 
-    with console.status("[bold blue]Building Docker image...[/bold blue]") as status:
-        # Build Docker image
-        status.update("[bold blue]Cloning repository and building action...[/bold blue]")
-        run(
-            [
-                "docker",
-                "build",
-                "--build-arg",
-                f"REPO_URL={repo_url}",
-                "--build-arg",
-                f"COMMIT_HASH={commit_hash}",
-                "--build-arg",
-                f"SUB_PATH={sub_path}",
-                "-t",
-                image_tag,
-                "-f",
-                str(dockerfile_path),
-                str(work_dir),
-            ],
-            capture_output=True,
+    # Detect Node.js version from action.yml before building
+    node_version = detect_node_version(org, repo, commit_hash, sub_path, gh=gh)
+    if node_version != "20":
+        console.print(f"  [green]✓[/green] Detected Node.js version: [bold]node{node_version}[/bold]")
+
+    # Build Docker image, capturing output so we can summarise the steps afterwards
+    docker_build_cmd = [
+        "docker",
+        "build",
+        "--progress=plain",
+        "--build-arg",
+        f"NODE_VERSION={node_version}",
+        "--build-arg",
+        f"REPO_URL={repo_url}",
+        "--build-arg",
+        f"COMMIT_HASH={commit_hash}",
+        "--build-arg",
+        f"SUB_PATH={sub_path}",
+        "-t",
+        image_tag,
+        "-f",
+        str(dockerfile_path),
+        str(work_dir),
+    ]
+    if not cache:
+        docker_build_cmd.insert(3, "--no-cache")
+
+    with console.status("[bold blue]Building Docker image...[/bold blue]"):
+        build_result = subprocess.run(
+            docker_build_cmd, capture_output=True, text=True,
         )
-        console.print("  [green]✓[/green] Docker image built")
+        if build_result.returncode != 0:
+            # Show full output on failure so the user can diagnose
+            console.print("[red]Docker build failed. Output:[/red]")
+            console.print(build_result.stdout)
+            console.print(build_result.stderr)
+            _print_docker_build_steps(build_result)
+            raise subprocess.CalledProcessError(build_result.returncode, docker_build_cmd)
+
+    if show_build_steps:
+        _print_docker_build_steps(build_result)
+
+    with console.status("[bold blue]Extracting build artifacts...[/bold blue]") as status:
 
         # Extract original and rebuilt dist from container
         try:
-            status.update("[bold blue]Extracting build artifacts...[/bold blue]")
             run(
                 ["docker", "create", "--name", container_name, image_tag],
                 capture_output=True,
@@ -1086,7 +1183,7 @@ def diff_js_files(
         orig_file = original_dir / rel_path
         built_file = rebuilt_dir / rel_path
 
-        file_link = f"[link={blob_url}/{out_dir_name}/{rel_path}]{rel_path}[/link]"
+        file_link = link(f"{blob_url}/{out_dir_name}/{rel_path}", str(rel_path))
 
         if rel_path not in original_files:
             console.print(f"  [green]+[/green] {file_link} [dim](only in rebuilt)[/dim]")
@@ -1230,14 +1327,18 @@ def _format_diff_text(lines: list[str]) -> Text:
     return diff_text
 
 
-def verify_single_action(action_ref: str, gh: GitHubClient | None = None, ci_mode: bool = False) -> bool:
+def verify_single_action(
+    action_ref: str, gh: GitHubClient | None = None, ci_mode: bool = False,
+    cache: bool = True, show_build_steps: bool = False,
+) -> bool:
     """Verify a single action reference. Returns True if verification passed."""
     org, repo, sub_path, commit_hash = parse_action_ref(action_ref)
 
     with tempfile.TemporaryDirectory(prefix="verify-action-") as tmp:
         work_dir = Path(tmp)
         original_dir, rebuilt_dir, action_type, out_dir_name = build_in_docker(
-            org, repo, commit_hash, work_dir, sub_path=sub_path,
+            org, repo, commit_hash, work_dir, sub_path=sub_path, gh=gh,
+            cache=cache, show_build_steps=show_build_steps,
         )
 
         # Non-JavaScript actions (docker, composite) don't have compiled JS to verify
@@ -1272,16 +1373,18 @@ def verify_single_action(action_ref: str, gh: GitHubClient | None = None, ci_mod
             )
 
     console.print()
+    checklist_hint = f"\n[dim]Security review checklist: {SECURITY_CHECKLIST_URL}[/dim]"
     if all_match:
         if is_js_action:
             result_msg = "[green bold]All compiled JavaScript matches the rebuild[/green bold]"
         else:
             result_msg = f"[green bold]{action_type} action — no compiled JS to verify[/green bold]"
-        console.print(Panel(result_msg, border_style="green", title="RESULT"))
+        console.print(Panel(result_msg + checklist_hint, border_style="green", title="RESULT"))
     else:
         console.print(
             Panel(
-                "[red bold]Differences detected between published and rebuilt JS[/red bold]",
+                "[red bold]Differences detected between published and rebuilt JS[/red bold]"
+                + checklist_hint,
                 border_style="red",
                 title="RESULT",
             )
@@ -1305,7 +1408,8 @@ def extract_action_refs_from_pr(pr_number: int, gh: GitHubClient | None = None) 
     refs: list[str] = []
     for line in diff_text.splitlines():
         # Match lines like: +      - uses: org/repo/sub@hash  # tag
-        match = re.search(r"^\+.*uses:\s+([^@\s]+)@([0-9a-f]{40})", line)
+        # Also match 'use:' (common typo for 'uses:')
+        match = re.search(r"^\+.*uses?:\s+([^@\s]+)@([0-9a-f]{40})", line)
         if match:
             action_path = match.group(1)
             commit_hash = match.group(2)
@@ -1324,7 +1428,7 @@ def get_gh_user(gh: GitHubClient | None = None) -> str:
     return gh.get_authenticated_user()
 
 
-def check_dependabot_prs(gh: GitHubClient) -> None:
+def check_dependabot_prs(gh: GitHubClient, cache: bool = True, show_build_steps: bool = False) -> None:
     """List open dependabot PRs, verify each, and optionally merge."""
     console.print()
     console.rule("[bold]Dependabot PR Review[/bold]")
@@ -1370,7 +1474,7 @@ def check_dependabot_prs(gh: GitHubClient) -> None:
         exc_table.add_column("Reason", style="yellow")
 
         for pr, reason in excluded_prs:
-            pr_link = f"[link={pr['url']}]#{pr['number']}[/link]"
+            pr_link = link(pr["url"], f"#{pr['number']}")
             exc_table.add_row(pr_link, pr["title"], reason)
 
         console.print(exc_table)
@@ -1394,7 +1498,7 @@ def check_dependabot_prs(gh: GitHubClient) -> None:
     table.add_column("PR", min_width=8)
 
     for pr in prs:
-        pr_link = f"[link={pr['url']}]#{pr['number']}[/link]"
+        pr_link = link(pr["url"], f"#{pr['number']}")
         table.add_row(str(pr["number"]), pr["title"], pr_link)
 
     console.print(table)
@@ -1413,7 +1517,7 @@ def check_dependabot_prs(gh: GitHubClient) -> None:
 
     for pr in prs:
         console.print()
-        pr_link = f"[link=https://github.com/apache/infrastructure-actions/pull/{pr['number']}]#{pr['number']}[/link]"
+        pr_link = link(f"https://github.com/apache/infrastructure-actions/pull/{pr['number']}", f"#{pr['number']}")
         console.rule(f"[bold]PR {pr_link}: {pr['title']}[/bold]")
 
         # Extract all action references from PR diff
@@ -1459,11 +1563,11 @@ def check_dependabot_prs(gh: GitHubClient) -> None:
                         sub_ref = f"{org_repo}/{sp}@{commit_hash}"
                     else:
                         sub_ref = f"{org_repo}@{commit_hash}"
-                    if not verify_single_action(sub_ref, gh=gh):
+                    if not verify_single_action(sub_ref, gh=gh, cache=cache, show_build_steps=show_build_steps):
                         passed = False
             else:
                 # Simple single action (no sub-path)
-                if not verify_single_action(f"{org_repo}@{commit_hash}", gh=gh):
+                if not verify_single_action(f"{org_repo}@{commit_hash}", gh=gh, cache=cache, show_build_steps=show_build_steps):
                     passed = False
 
         if not passed:
@@ -1534,10 +1638,16 @@ def check_dependabot_prs(gh: GitHubClient) -> None:
         )
 
 
+def _exit(code: int) -> None:
+    console.print(f"Exit code: {code}")
+    sys.exit(code)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Verify compiled JS in a GitHub Action matches a local rebuild.",
         usage="uv run %(prog)s [org/repo@commit_hash | --check-dependabot-prs | --from-pr N]",
+        epilog=f"Security review checklist: {SECURITY_CHECKLIST_URL}",
     )
     parser.add_argument(
         "action_ref",
@@ -1570,13 +1680,25 @@ def main() -> None:
         action="store_true",
         help="Non-interactive mode: skip all prompts, auto-select defaults (for CI pipelines)",
     )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Build Docker image from scratch without using layer cache",
+    )
+    parser.add_argument(
+        "--show-build-steps",
+        action="store_true",
+        help="Show Docker build step summary on successful builds (always shown on failure)",
+    )
     args = parser.parse_args()
 
     ci_mode = args.ci
+    cache = not args.no_cache
+    show_build_steps = args.show_build_steps
 
     if not shutil.which("docker"):
         console.print("[red]Error:[/red] docker is required but not found in PATH")
-        sys.exit(1)
+        _exit(1)
 
     # Build the GitHub client
     if args.no_gh:
@@ -1585,7 +1707,7 @@ def main() -> None:
                 "[red]Error:[/red] --no-gh requires a GitHub token. "
                 "Pass --github-token TOKEN or set the GITHUB_TOKEN environment variable."
             )
-            sys.exit(1)
+            _exit(1)
         gh = GitHubClient(token=args.github_token)
     else:
         if not shutil.which("gh"):
@@ -1593,26 +1715,26 @@ def main() -> None:
                 "[red]Error:[/red] gh (GitHub CLI) is not installed. "
                 "Either install gh or use --no-gh with a --github-token."
             )
-            sys.exit(1)
+            _exit(1)
         gh = GitHubClient(token=args.github_token)
 
     if args.from_pr:
         action_refs = extract_action_refs_from_pr(args.from_pr, gh=gh)
         if not action_refs:
             console.print(f"[red]Error:[/red] could not extract action reference from PR #{args.from_pr}")
-            sys.exit(1)
+            _exit(1)
         for ref in action_refs:
             console.print(f"  Extracted action reference from PR #{args.from_pr}: [bold]{ref}[/bold]")
-        passed = all(verify_single_action(ref, gh=gh, ci_mode=ci_mode) for ref in action_refs)
-        sys.exit(0 if passed else 1)
+        passed = all(verify_single_action(ref, gh=gh, ci_mode=ci_mode, cache=cache, show_build_steps=show_build_steps) for ref in action_refs)
+        _exit(0 if passed else 1)
     elif args.check_dependabot_prs:
-        check_dependabot_prs(gh=gh)
+        check_dependabot_prs(gh=gh, cache=cache, show_build_steps=show_build_steps)
     elif args.action_ref:
-        passed = verify_single_action(args.action_ref, gh=gh, ci_mode=ci_mode)
-        sys.exit(0 if passed else 1)
+        passed = verify_single_action(args.action_ref, gh=gh, ci_mode=ci_mode, cache=cache, show_build_steps=show_build_steps)
+        _exit(0 if passed else 1)
     else:
         parser.print_help()
-        sys.exit(1)
+        _exit(1)
 
 
 if __name__ == "__main__":

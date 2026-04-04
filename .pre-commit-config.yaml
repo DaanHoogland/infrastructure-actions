@@ -14,31 +14,18 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-#
-name: rat
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-
-permissions:
-  contents: read
-
-jobs:
-  rat:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Set up JDK 21
-        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
-        with:
-          java-version: '21'
-          distribution: 'temurin'
-
-      - name: Run Creadur RAT
-        run: utils/rat.sh
+---
+default_stages: [pre-commit]
+default_language_version:
+  python: python3
+minimum_pre_commit_version: '3.2.0'
+repos:
+  - repo: local
+    hooks:
+      - id: sort-actions-yml
+        name: Sort actions.yml
+        entry: ./scripts/sort_yml.py
+        language: python
+        additional_dependencies: ['rich>=12.4.4', 'ruamel.yaml']
+        require_serial: true
+        files: ^actions\.yml$
