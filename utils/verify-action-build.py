@@ -848,6 +848,24 @@ RUN if [ -d "node_modules" ]; then \
 RUN OUT_DIR=$(cat /out-dir.txt); \
     if [ -d "$OUT_DIR" ]; then find "$OUT_DIR" -name '*.js' -print -delete > /deleted-js.log 2>&1; else echo "no $OUT_DIR/ directory" > /deleted-js.log; fi
 
+# If an approved (previous) commit hash is provided, restore the dev-dependency
+# lock files from that commit so the rebuild uses the same toolchain (e.g. same
+# rollup/ncc/webpack version) that produced the original dist/.
+# This avoids false positives when a version bump updates devDependencies but the
+# committed dist/ was built with the old toolchain.
+ARG APPROVED_HASH=""
+RUN if [ -n "$APPROVED_HASH" ]; then \
+      echo "approved-hash: $APPROVED_HASH" >> /build-info.log; \
+      for f in package.json package-lock.json yarn.lock pnpm-lock.yaml; do \
+        if [ -f "$f" ]; then \
+          if git show "$APPROVED_HASH:$f" > "/tmp/approved-$f" 2>/dev/null; then \
+            cp "/tmp/approved-$f" "$f"; \
+            echo "restored: $f from approved $APPROVED_HASH" >> /build-info.log; \
+          fi; \
+        fi; \
+      done; \
+    fi
+
 # Detect the build directory — where package.json lives.
 # Some repos (e.g. gradle/actions) keep sources in a subdirectory with its own package.json.
 # Also check for a root-level build script (e.g. a 'build' shell script).
@@ -1016,8 +1034,13 @@ def build_in_docker(
     gh: GitHubClient | None = None,
     cache: bool = True,
     show_build_steps: bool = False,
+    approved_hash: str = "",
 ) -> tuple[Path, Path, str, str, bool, Path, Path]:
     """Build the action in a Docker container and extract original + rebuilt dist.
+
+    When *approved_hash* is supplied the Docker build restores package lock files
+    from that commit so the rebuild uses the same dev-dependency versions that
+    produced the original dist/.
 
     Returns (original_dir, rebuilt_dir, action_type, out_dir_name,
              has_node_modules, original_node_modules, rebuilt_node_modules).
@@ -1068,6 +1091,8 @@ def build_in_docker(
         f"COMMIT_HASH={commit_hash}",
         "--build-arg",
         f"SUB_PATH={sub_path}",
+        "--build-arg",
+        f"APPROVED_HASH={approved_hash}",
         "-t",
         image_tag,
         "-f",
@@ -2484,6 +2509,10 @@ def verify_single_action(
     """Verify a single action reference. Returns True if verification passed."""
     org, repo, sub_path, commit_hash = parse_action_ref(action_ref)
 
+    # Look up approved versions early — used for the lock-file retry and the
+    # later approved-version diff section.
+    approved = find_approved_versions(org, repo)
+
     # Track all checks performed for the summary
     checks_performed: list[tuple[str, str, str]] = []
     non_js_warnings: list[str] = []
@@ -2606,11 +2635,6 @@ def verify_single_action(
             all_match = diff_js_files(
                 original_dir, rebuilt_dir, org, repo, commit_hash, out_dir_name,
             )
-            checks_performed.append((
-                "JS build verification",
-                "pass" if all_match else "fail",
-                "compiled JS matches rebuild" if all_match else "DIFFERENCES DETECTED",
-            ))
 
             # If no compiled JS was found in dist/ but node_modules is vendored,
             # verify node_modules instead
@@ -2621,8 +2645,76 @@ def verify_single_action(
                 )
                 all_match = all_match and nm_match
 
+            used_approved_lockfile = False
+            if not all_match and approved:
+                # The rebuild produced different JS.  This may be caused by a
+                # dev-dependency bump (e.g. rollup, ncc, webpack) where the
+                # committed dist/ was built with the *previous* toolchain but
+                # the lock file now pins a newer version.
+                # Retry the build using the approved version's lock files.
+                prev_hash = approved[0]["hash"]
+                console.print()
+                console.print(
+                    Panel(
+                        f"[yellow]JS mismatch detected — retrying build with dev-dependency "
+                        f"lock files from the previously approved commit "
+                        f"[bold]{prev_hash[:12]}[/bold] to check whether the difference "
+                        f"is caused by a toolchain version bump.[/yellow]",
+                        border_style="yellow",
+                        title="RETRY WITH APPROVED LOCK FILES",
+                    )
+                )
+
+                retry_dir = work_dir / "retry"
+                retry_dir.mkdir(exist_ok=True)
+                (retry_orig, retry_rebuilt, _, _, retry_has_nm,
+                 retry_orig_nm, retry_rebuilt_nm) = build_in_docker(
+                    org, repo, commit_hash, retry_dir, sub_path=sub_path, gh=gh,
+                    cache=cache, show_build_steps=show_build_steps,
+                    approved_hash=prev_hash,
+                )
+
+                retry_match = diff_js_files(
+                    retry_orig, retry_rebuilt, org, repo, commit_hash, out_dir_name,
+                )
+                if retry_has_nm:
+                    retry_nm = diff_node_modules(
+                        retry_orig_nm, retry_rebuilt_nm,
+                        org, repo, commit_hash,
+                    )
+                    retry_match = retry_match and retry_nm
+
+                if retry_match:
+                    all_match = True
+                    used_approved_lockfile = True
+                    console.print()
+                    console.print(
+                        Panel(
+                            "[yellow bold]The compiled JS matches when rebuilt with the "
+                            "previously approved version's dev-dependency lock files.[/yellow bold]\n\n"
+                            "This means the action's [bold]devDependencies[/bold] (build toolchain) "
+                            "changed between versions, but the committed dist/ was built with the "
+                            "old toolchain.  The source code itself is fine — only the build tools "
+                            "differ.\n\n"
+                            "[bold]Review recommendation:[/bold] verify that the devDependency "
+                            "changes are benign (e.g. rollup, ncc, or webpack version bumps) "
+                            "before approving.",
+                            border_style="yellow",
+                            title="MATCHED WITH APPROVED LOCK FILES",
+                        )
+                    )
+
+            checks_performed.append((
+                "JS build verification",
+                "pass" if all_match and not used_approved_lockfile else
+                "warn" if all_match and used_approved_lockfile else "fail",
+                "compiled JS matches rebuild" if all_match and not used_approved_lockfile else
+                "matches with approved lock files (devDeps changed)" if used_approved_lockfile else
+                "DIFFERENCES DETECTED",
+            ))
+
         # Check for previously approved versions and offer to diff
-        approved = find_approved_versions(org, repo)
+        # (reuse the list fetched earlier for the approved_hash build arg)
         if approved:
             checks_performed.append(("Approved versions", "info", f"{len(approved)} version(s) on file"))
             selected_hash = show_approved_versions(org, repo, commit_hash, approved, gh=gh, ci_mode=ci_mode)
